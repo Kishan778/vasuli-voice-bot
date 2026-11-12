@@ -130,19 +130,20 @@ def analyze_basuli_sheet(user_question=""):
 
     return "\n".join(summary_parts)
 
-# --- 4. NATURAL REAL HUMAN MALE AUDIO ---
+# --- 4. FAST & PROFESSIONAL MANAGER AUDIO ---
 async def text_to_voice(text, filename="reply.mp3"):
     clean_text = re.sub(r'<think>.*?</think>', '', str(text), flags=re.DOTALL)
     clean_text = re.sub(r'[*#`_~>-]', '', clean_text).strip()
     if not clean_text:
-        clean_text = "Bhai, abhi data nahi mil pa raha hai."
+        clean_text = "Sir, abhi data nahi mil pa raha hai."
 
-    # Natural human speed (+2%) aur natural male pitch (-2Hz)
+    # rate="+18%" = Fast, crisp professional speaking speed
+    # pitch="-4Hz" = Clear, authoritative Senior Manager voice
     communicate = edge_tts.Communicate(
         clean_text,
         voice="hi-IN-MadhurNeural",
-        rate="+2%",
-        pitch="-2Hz"
+        rate="+18%",
+        pitch="-4Hz"
     )
     await communicate.save(filename)
     return filename, clean_text
@@ -221,25 +222,26 @@ async def process_query(update: Update, user_text: str):
     sheet_analysis = analyze_basuli_sheet(user_text)
 
     if sheet_analysis == "NO_SHEET_LOADED":
-        msg = "Bhai, abhi Google Sheet load nahi ho payi hai. Ek baar link check kar lo ya seedha Excel file yahan bhej do."
+        msg = "Sir, Google Sheet load nahi ho payi hai. Ek baar link check kar lein ya Excel file bhej dein."
         voice_note, clean_reply = await text_to_voice(msg, "err.mp3")
         with open(voice_note, "rb") as audio:
             await update.message.reply_voice(voice=audio, caption=clean_reply)
         return
 
     system_prompt = f"""
-    Tum Gadarwara ke local distribution office ke bade bhai / Senior Manager ho. 
-    Tumhe robot ya kitabi Hindi (jaise 'vasul karne hain', 'kripya', 'upasthit') BILKUL nahi bolni hai.
-    Ekdum aam bolchal ki desi vyapari bhasha bolni hai jaise hum roz dukan ya office mein baat karte hain (jaise: 'Sitaram Rathi se 1 lakh 401 rupaye lene hain', '8 bill pade hain unke', 'Tarun bhai aaj wahan se paisa nikalwana hi hai').
+    Tum ek strict, to-the-point aur Professional Senior Vasuli Manager ho.
+    Salesmen ke naam: Tarun (Local market) aur Ajay (Upcountry market).
 
     NICHE GOOGLE SHEET KA LIVE DATA HAI:
     {sheet_analysis}
 
     SAKHT NIYAM:
-    1. Dukan ke naam ke aage laga 'PARLE' ya 'ZB' mat bolna, seedha naam bolna (jaise 'Sitaram Rathi', 'Gurukrapa Traders').
-    2. Agar Boss kisi party ke sare bills ya bill-wise detail mangein (chahe 8 bill hon ya 10), toh EK BHI BILL MAT CHHODNA! Sare ke sare bills ki tarikh, rupaye aur kitne din upar (overdue) ho gaye hain, ek-ek karke poora ginwana.
-    3. Agar Boss bolein ki 'Tarun ko bolo...' ya 'Ajay ke liye voice note do...', toh seedha Tarun/Ajay se baat karte hue desi manager style mein voice note banana taaki Boss use seedha WhatsApp par forward kar sakein.
-    4. Koi star (**) ya markdown mat lagana, aur rupayon ko bolchal ke hisab se likhna taaki sunne mein bilkul asli insaan lage.
+    1. 'Bhai', 'Yaar', ya 'Bade bhai' jaise shabd Kisi bhi haal mein mat bolna. Boss se baat karte waqt 'Sir' bolna, aur Salesman (Tarun/Ajay) ko seedha unke naam se address karna.
+    2. Tone ekdum professional, vyaparik aur crisp rakhna (Jaise: 'Sir, Sitaram Rathi ke 8 bills mein kul 1 lakh 401 rupaye baki hain').
+    3. Party ka naam bolte waqt aage laga 'PARLE' ya 'ZB' hata kar seedha dukan ka naam bolna.
+    4. Agar bill-wise detail mangi jaye, toh bina ek bhi bill chhode saare bills ki tarikh, bill number aur rupaye fatafat point-to-point ginwana.
+    5. Agar Boss bolein ki Tarun ya Ajay ke liye voice note do, toh ekdum kadak Manager ki tarah seedha aadesh dena (Jaise: 'Tarun, aaj Gadarwara market mein in 5 partiyon ka payment har haal mein clear karwana hai, dhyan rahe').
+    6. Koi star (**) ya markdown mat lagana.
     """
 
     ai_reply = ask_groq(system_prompt, user_text)
@@ -247,7 +249,7 @@ async def process_query(update: Update, user_text: str):
 
     voice_note, clean_reply = await text_to_voice(ai_reply, "vasuli_reply.mp3")
     with open(voice_note, "rb") as audio:
-        await update.message.reply_voice(voice=audio, caption=f"📋 Hisab:\n{clean_reply}")
+        await update.message.reply_voice(voice=audio, caption=f"📋 Manager Report:\n{clean_reply}")
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     voice_file = await update.message.voice.get_file()
