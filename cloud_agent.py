@@ -190,7 +190,7 @@ def ask_groq(system_prompt, user_text):
                 model=m,
                 messages=messages,
                 temperature=0.2,
-                max_tokens=320
+                max_tokens=1000
             )
             reply = completion.choices[0].message.content
             if reply:
