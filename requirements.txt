@@ -1,0 +1,6 @@
+python-telegram-bot
+edge-tts
+groq
+pandas
+requests
+openpyxl
