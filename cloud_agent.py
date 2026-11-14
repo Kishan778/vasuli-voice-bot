@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import time
 import asyncio
 import threading
 import requests
@@ -8,7 +9,6 @@ import pandas as pd
 import edge_tts
 from flask import Flask, request
 from groq import Groq
-from telegram import Bot
 
 # --- 1. CREDENTIALS & LINKS ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8851118107:AAG-1M6vMIimiF_5qCh88ZHJsSQboDjER4k")
@@ -18,9 +18,9 @@ GOOGLE_SHEET_URL = os.environ.get(
     "https://docs.google.com/spreadsheets/d/1hMjxdXH8wCiCH6WU8VWlYhbXmxhYbr-THyGatXjzxQk/edit?usp=sharing"
 )
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://vasuli-voice-bot.onrender.com").rstrip("/")
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 groq_client = Groq(api_key=GROQ_API_KEY)
-bot = Bot(token=TELEGRAM_TOKEN)
 app = Flask(__name__)
 
 uploaded_sheets = None
@@ -35,7 +35,27 @@ def extract_sheet_id(url_or_id):
         return clean.split("/d/")[1].split("/")[0]
     return clean
 
-# --- 2. GOOGLE SHEET LOADER ---
+# --- 2. DIRECT TELEGRAM SENDER (Zero Async Hang) ---
+def tg_send_message(chat_id, text):
+    try:
+        requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=15)
+    except Exception as e:
+        print(f"Send msg error: {e}")
+
+def tg_send_voice(chat_id, audio_path, caption=""):
+    try:
+        with open(audio_path, "rb") as f:
+            requests.post(
+                f"{TG_API}/sendVoice",
+                data={"chat_id": chat_id, "caption": caption[:1020]},
+                files={"voice": f},
+                timeout=30
+            )
+    except Exception as e:
+        print(f"Send voice error: {e}")
+        tg_send_message(chat_id, caption)
+
+# --- 3. GOOGLE SHEET LOADER ---
 def load_all_tabs():
     global uploaded_sheets
     if uploaded_sheets is not None:
@@ -65,7 +85,7 @@ def load_all_tabs():
 
     return (sheets_dict, "Live Google Sheet") if sheets_dict else (None, "Load failed")
 
-# --- 3. BASULI SHEET ANALYSIS ---
+# --- 4. BASULI SHEET ANALYSIS ---
 def analyze_basuli_sheet():
     sheets_dict, source_name = load_all_tabs()
     if not sheets_dict:
@@ -125,23 +145,30 @@ def analyze_basuli_sheet():
 
     return "\n".join(summary_parts)
 
-# --- 4. FAST PROFESSIONAL MANAGER VOICE ---
-async def generate_voice(text, filename):
+# --- 5. FAST PROFESSIONAL MANAGER VOICE ---
+def generate_voice_sync(text, filename):
     clean_text = re.sub(r'<think>.*?</think>', '', str(text), flags=re.DOTALL)
     clean_text = re.sub(r'[*#`_~>-]', '', clean_text).strip()
     if not clean_text:
         clean_text = "Sir, data nahi mil pa raha hai."
 
-    communicate = edge_tts.Communicate(
-        clean_text,
-        voice="hi-IN-MadhurNeural",
-        rate="+18%",
-        pitch="-4Hz"
-    )
-    await communicate.save(filename)
+    async def _save():
+        communicate = edge_tts.Communicate(
+            clean_text,
+            voice="hi-IN-MadhurNeural",
+            rate="+18%",
+            pitch="-4Hz"
+        )
+        await communicate.save(filename)
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_save())
+    finally:
+        loop.close()
     return filename, clean_text
 
-# --- 5. GROQ AI (1000 Tokens + Memory) ---
+# --- 6. GROQ AI (1000 Tokens + Memory) ---
 def ask_groq(system_prompt, user_text):
     global chat_memory
     try:
@@ -177,8 +204,8 @@ def ask_groq(system_prompt, user_text):
 
     return "Sir, abhi AI server se jawab nahi aa paya, ek baar dubara bolein."
 
-# --- 6. BACKGROUND ASYNC PROCESSOR ---
-async def process_telegram_update(data):
+# --- 7. BACKGROUND WORKER ---
+def process_telegram_update(data):
     global uploaded_sheets
     message = data.get("message") or data.get("edited_message")
     if not message:
@@ -193,12 +220,16 @@ async def process_telegram_update(data):
             doc = message["document"]
             file_name = doc.get("file_name", "").lower()
             if not (file_name.endswith('.xlsx') or file_name.endswith('.xls') or file_name.endswith('.csv')):
-                await bot.send_message(chat_id=chat_id, text="Sir, kripya sirf Excel (.xlsx) ya CSV file bhejein.")
+                tg_send_message(chat_id, "Sir, kripya sirf Excel (.xlsx) ya CSV file bhejein.")
                 return
 
-            tg_file = await bot.get_file(doc["file_id"])
+            file_info = requests.get(f"{TG_API}/getFile", params={"file_id": doc["file_id"]}, timeout=15).json()
+            file_path = file_info["result"]["file_path"]
+            file_bytes = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}", timeout=20).content
+
             local_path = f"/tmp/up_{msg_id}_{file_name}"
-            await tg_file.download_to_drive(local_path)
+            with open(local_path, "wb") as f:
+                f.write(file_bytes)
 
             if file_name.endswith('.csv'):
                 uploaded_sheets = {"Sheet1": pd.read_csv(local_path)}
@@ -207,17 +238,20 @@ async def process_telegram_update(data):
 
             sheet_summary = analyze_basuli_sheet()
             ai_reply = ask_groq(f"Sheet Data:\n{sheet_summary}", "User ne nayi Excel file bheji hai. Strict Senior Manager ki tarah 3 line mein total pending amount aur top parties batayein.")
-            audio_file, clean_reply = await generate_voice(ai_reply, f"/tmp/doc_{msg_id}.mp3")
-            with open(audio_file, "rb") as audio:
-                await bot.send_voice(chat_id=chat_id, voice=audio, caption=f"✅ Excel File Load Ho Gayi!\n\n{clean_reply}")
+            audio_file, clean_reply = generate_voice_sync(ai_reply, f"/tmp/doc_{msg_id}.mp3")
+            tg_send_voice(chat_id, audio_file, f"✅ Excel File Load Ho Gayi!\n\n{clean_reply}")
             return
 
-        # Case B: Voice Message or Text Message
+        # Case B: Voice or Text Message
         user_text = ""
         if "voice" in message:
-            tg_file = await bot.get_file(message["voice"]["file_id"])
+            file_info = requests.get(f"{TG_API}/getFile", params={"file_id": message["voice"]["file_id"]}, timeout=15).json()
+            file_path = file_info["result"]["file_path"]
+            voice_bytes = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}", timeout=20).content
+
             ogg_path = f"/tmp/voice_{msg_id}.ogg"
-            await tg_file.download_to_drive(ogg_path)
+            with open(ogg_path, "wb") as f:
+                f.write(voice_bytes)
 
             with open(ogg_path, "rb") as f:
                 transcription = groq_client.audio.transcriptions.create(
@@ -230,19 +264,18 @@ async def process_telegram_update(data):
         elif "text" in message:
             user_text = message["text"]
             if user_text.startswith("/start"):
-                await bot.send_message(chat_id=chat_id, text="Sir, Senior Vasuli Manager Agent active hai. Voice note ya text bhej kar hisab poochein.")
+                tg_send_message(chat_id, "Sir, Senior Vasuli Manager Agent active hai. Voice note ya text bhej kar hisab poochein.")
                 return
         else:
             return
 
-        print(f"User Query: {user_text}")
+        print(f"User Query: {user_text}", flush=True)
         sheet_analysis = analyze_basuli_sheet()
 
         if sheet_analysis == "NO_SHEET_LOADED":
             msg = "Sir, Google Sheet load nahi ho payi hai. Link check kar lein ya seedha Excel file bhej dein."
-            audio_file, clean_reply = await generate_voice(msg, f"/tmp/err_{msg_id}.mp3")
-            with open(audio_file, "rb") as audio:
-                await bot.send_voice(chat_id=chat_id, voice=audio, caption=clean_reply)
+            audio_file, clean_reply = generate_voice_sync(msg, f"/tmp/err_{msg_id}.mp3")
+            tg_send_voice(chat_id, audio_file, clean_reply)
             return
 
         system_prompt = f"""
@@ -262,23 +295,16 @@ async def process_telegram_update(data):
         """
 
         ai_reply = ask_groq(system_prompt, user_text)
-        print(f"AI Reply: {ai_reply}")
+        print(f"AI Reply: {ai_reply}", flush=True)
 
-        audio_file, clean_reply = await generate_voice(ai_reply, f"/tmp/rep_{msg_id}.mp3")
-        with open(audio_file, "rb") as audio:
-            await bot.send_voice(chat_id=chat_id, voice=audio, caption=f"📋 Manager Report:\n{clean_reply}")
+        audio_file, clean_reply = generate_voice_sync(ai_reply, f"/tmp/rep_{msg_id}.mp3")
+        tg_send_voice(chat_id, audio_file, f"📋 Manager Report:\n{clean_reply}")
 
     except Exception as e:
-        print(f"Processing error: {e}")
-        try:
-            await bot.send_message(chat_id=chat_id, text=f"Sir, technical dikkat aayi: {str(e)[:150]}")
-        except Exception:
-            pass
+        print(f"Processing error: {e}", flush=True)
+        tg_send_message(chat_id, f"Sir, technical dikkat aayi: {str(e)[:150]}")
 
-def run_in_background(data):
-    asyncio.run(process_telegram_update(data))
-
-# --- 7. FLASK ROUTES (Instant Wake-Up & Zero Timeout) ---
+# --- 8. FLASK ROUTES ---
 @app.route("/", methods=["GET", "HEAD"])
 def health_check():
     return "Vasuli Manager Bot is Alive and Active!", 200
@@ -292,24 +318,24 @@ def telegram_webhook():
             processed_updates.add(update_id)
             if len(processed_updates) > 200:
                 processed_updates.clear()
-            threading.Thread(target=run_in_background, args=(data,), daemon=True).start()
+            threading.Thread(target=process_telegram_update, args=(data,), daemon=True).start()
     return "OK", 200
 
-# --- 8. AUTO-REGISTER WEBHOOK ON STARTUP ---
-def setup_webhook():
+def register_webhook_delayed():
+    time.sleep(3)
     try:
         webhook_target = f"{RENDER_URL}/telegram"
         res = requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
+            f"{TG_API}/setWebhook",
             params={"url": webhook_target, "drop_pending_updates": True},
             timeout=10
         )
-        print(f"Webhook Setup Status: {res.json()}")
+        print(f"Webhook Setup Status: {res.json()}", flush=True)
     except Exception as e:
-        print(f"Webhook setup error: {e}")
-
-setup_webhook()
+        print(f"Webhook setup error: {e}", flush=True)
 
 if __name__ == "__main__":
+    threading.Thread(target=register_webhook_delayed, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
+    print(f"Starting Flask Server on port {port}...", flush=True)
     app.run(host="0.0.0.0", port=port)
