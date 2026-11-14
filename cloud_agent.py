@@ -1,12 +1,14 @@
 import io
 import os
 import re
+import asyncio
+import threading
 import requests
 import pandas as pd
 import edge_tts
+from flask import Flask, request
 from groq import Groq
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram import Bot
 
 # --- 1. CREDENTIALS & LINKS ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8851118107:AAG-1M6vMIimiF_5qCh88ZHJsSQboDjER4k")
@@ -15,12 +17,15 @@ GOOGLE_SHEET_URL = os.environ.get(
     "GOOGLE_SHEET_URL",
     "https://docs.google.com/spreadsheets/d/1hMjxdXH8wCiCH6WU8VWlYhbXmxhYbr-THyGatXjzxQk/edit?usp=sharing"
 )
-# Render apna URL khud RENDER_EXTERNAL_URL mein deta hai
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://vasuli-voice-bot.onrender.com")
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://vasuli-voice-bot.onrender.com").rstrip("/")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
+bot = Bot(token=TELEGRAM_TOKEN)
+app = Flask(__name__)
+
 uploaded_sheets = None
 chat_memory = []
+processed_updates = set()
 
 def extract_sheet_id(url_or_id):
     clean = str(url_or_id).strip().replace('[', '').replace(']', '')
@@ -30,7 +35,7 @@ def extract_sheet_id(url_or_id):
         return clean.split("/d/")[1].split("/")[0]
     return clean
 
-# --- 2. GOOGLE SHEET KE SARE TABS (tarun, ajay) LOAD KARNA ---
+# --- 2. GOOGLE SHEET LOADER ---
 def load_all_tabs():
     global uploaded_sheets
     if uploaded_sheets is not None:
@@ -38,40 +43,35 @@ def load_all_tabs():
 
     sheet_id = extract_sheet_id(GOOGLE_SHEET_URL)
     if not sheet_id or "YAHAN" in sheet_id:
-        return None, "Koi Sheet link nahi mila"
+        return None, "Sheet link missing"
 
     try:
-        xlsx_url = "https://docs.google.com/spreadsheets/d/" + sheet_id + "/export?format=xlsx"
+        xlsx_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
         res = requests.get(xlsx_url, timeout=15)
         if res.status_code == 200:
-            sheets_dict = pd.read_excel(io.BytesIO(res.content), sheet_name=None)
-            return sheets_dict, "Live Google Sheet"
+            return pd.read_excel(io.BytesIO(res.content), sheet_name=None), "Live Google Sheet"
     except Exception as e:
-        print(f"XLSX fetch fallback: {e}")
+        print(f"XLSX error: {e}")
 
     sheets_dict = {}
     for tab in ['tarun', 'ajay']:
         try:
-            csv_url = "https://docs.google.com/spreadsheets/d/" + sheet_id + "/gviz/tq?tqx=out:csv&sheet=" + tab
+            csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={tab}"
             res = requests.get(csv_url, timeout=10)
             if res.status_code == 200 and len(res.text) > 20:
                 sheets_dict[tab] = pd.read_csv(io.StringIO(res.text))
         except Exception:
             pass
 
-    if sheets_dict:
-        return sheets_dict, "Live Google Sheet"
-    return None, "Sheet load nahi ho payi"
+    return (sheets_dict, "Live Google Sheet") if sheets_dict else (None, "Load failed")
 
-# --- 3. 'basuli' SHEET KA FULL ANALYSIS ENGINE (Sare Bills ke sath) ---
-def analyze_basuli_sheet(user_question=""):
+# --- 3. BASULI SHEET ANALYSIS ---
+def analyze_basuli_sheet():
     sheets_dict, source_name = load_all_tabs()
     if not sheets_dict:
         return "NO_SHEET_LOADED"
 
     summary_parts = [f"SOURCE: {source_name}"]
-    all_dfs = []
-
     for tab_name, df in sheets_dict.items():
         if df is None or df.empty:
             continue
@@ -90,7 +90,6 @@ def analyze_basuli_sheet(user_question=""):
 
         work_df = df.copy()
         work_df[party_col] = work_df[party_col].astype(str).str.strip()
-
         work_df = work_df[
             ~work_df[party_col].str.lower().isin(['total', 'grand total', 'nan', 'none', ''])
             & ~work_df[party_col].str.lower().str.startswith('total')
@@ -106,9 +105,6 @@ def analyze_basuli_sheet(user_question=""):
             work_df['Overdue'] = 0
             overdue_col = 'Overdue'
 
-        work_df['Salesman_Tab'] = tab_name
-        all_dfs.append(work_df)
-
         party_grouped = work_df.groupby(party_col).agg(
             Bills_Count=(amt_col, 'count'),
             Total_Pending=(amt_col, 'sum'),
@@ -120,25 +116,22 @@ def analyze_basuli_sheet(user_question=""):
         summary_parts.append(f"SALESMAN: {tab_name.upper()}")
         summary_parts.append(f"- {tab_name.upper()} KUL BAKI AMOUNT: Rs {tab_total:,.0f}")
         summary_parts.append(f"- Kul Bills: {len(work_df)} | Kul Parties: {len(party_grouped)}")
-        summary_parts.append(f"\n{tab_name.upper()} KI SARI PARTIES KA TOTAL HISAB (Bills Jodkar):")
+        summary_parts.append(f"\n{tab_name.upper()} PARTY-WISE TOTAL:")
         summary_parts.append(party_grouped.to_string(index=False))
 
-        # Har party ke individual bills bhi dena taaki 8 ke 8 bills poore bata sake
         cols_to_show = [c for c in [date_col, ref_col, party_col, amt_col, overdue_col] if c]
-        summary_parts.append(f"\n{tab_name.upper()} KE SARE INDIVIDUAL BILLS KI LIST:")
+        summary_parts.append(f"\n{tab_name.upper()} INDIVIDUAL BILLS:")
         summary_parts.append(work_df[cols_to_show].to_string(index=False))
 
     return "\n".join(summary_parts)
 
-# --- 4. FAST & PROFESSIONAL MANAGER AUDIO ---
-async def text_to_voice(text, filename="reply.mp3"):
+# --- 4. FAST PROFESSIONAL MANAGER VOICE ---
+async def generate_voice(text, filename):
     clean_text = re.sub(r'<think>.*?</think>', '', str(text), flags=re.DOTALL)
     clean_text = re.sub(r'[*#`_~>-]', '', clean_text).strip()
     if not clean_text:
-        clean_text = "Sir, abhi data nahi mil pa raha hai."
+        clean_text = "Sir, data nahi mil pa raha hai."
 
-    # rate="+18%" = Fast, crisp professional speaking speed
-    # pitch="-4Hz" = Clear, authoritative Senior Manager voice
     communicate = edge_tts.Communicate(
         clean_text,
         voice="hi-IN-MadhurNeural",
@@ -148,18 +141,15 @@ async def text_to_voice(text, filename="reply.mp3"):
     await communicate.save(filename)
     return filename, clean_text
 
-# --- 5. GROQ AI CALL (max_tokens=1000 taaki 8 ke 8 bills poore aayein) ---
+# --- 5. GROQ AI (1000 Tokens + Memory) ---
 def ask_groq(system_prompt, user_text):
     global chat_memory
     try:
         all_models = [m.id for m in groq_client.models.list().data]
         bad_keywords = ["allam", "whisper", "orpheus", "guard", "tts", "vision", "playai", "distil", "safeguard"]
-        valid_models = [
-            m for m in all_models
-            if not any(bad in m.lower() for bad in bad_keywords)
-        ]
+        valid_models = [m for m in all_models if not any(bad in m.lower() for bad in bad_keywords)]
         priority = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-        llama_m = [m for m in valid_models if m.lower().startswith("llama") or "llama" in m.lower()]
+        llama_m = [m for m in valid_models if "llama" in m.lower()]
         models_to_try = [m for m in priority if m in valid_models] + [m for m in llama_m if m not in priority] + [m for m in valid_models if m not in llama_m]
     except Exception:
         models_to_try = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
@@ -171,8 +161,8 @@ def ask_groq(system_prompt, user_text):
             completion = groq_client.chat.completions.create(
                 model=m,
                 messages=messages,
-                temperature=0.3,
-                max_tokens=1000  # Poore 8-10 bills bolne ke liye limit badha di gayi hai
+                temperature=0.2,
+                max_tokens=1000
             )
             reply = completion.choices[0].message.content
             if reply:
@@ -181,117 +171,145 @@ def ask_groq(system_prompt, user_text):
                 chat_memory.append({"role": "user", "content": user_text})
                 chat_memory.append({"role": "assistant", "content": reply})
                 return reply
-        except Exception:
+        except Exception as e:
+            print(f"Model {m} error: {e}")
             continue
 
-    return "Bhai, abhi server se jawab nahi aa paya, ek baar dubara bolna."
+    return "Sir, abhi AI server se jawab nahi aa paya, ek baar dubara bolein."
 
-# --- 6. EXCEL UPLOAD HANDLER ---
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- 6. BACKGROUND ASYNC PROCESSOR ---
+async def process_telegram_update(data):
     global uploaded_sheets
-    doc = update.message.document
-    file_name = doc.file_name.lower()
-
-    if not (file_name.endswith('.xlsx') or file_name.endswith('.xls') or file_name.endswith('.csv')):
-        await update.message.reply_text("Bhai sirf Excel (.xlsx) ya CSV file hi bhejo.")
+    message = data.get("message") or data.get("edited_message")
+    if not message:
         return
 
-    file = await doc.get_file()
-    local_path = f"uploaded_{file_name}"
-    await file.download_to_drive(local_path)
+    chat_id = message["chat"]["id"]
+    msg_id = message.get("message_id", 0)
 
     try:
-        if file_name.endswith('.csv'):
-            uploaded_sheets = {"Sheet1": pd.read_csv(local_path)}
+        # Case A: Excel / CSV Document
+        if "document" in message:
+            doc = message["document"]
+            file_name = doc.get("file_name", "").lower()
+            if not (file_name.endswith('.xlsx') or file_name.endswith('.xls') or file_name.endswith('.csv')):
+                await bot.send_message(chat_id=chat_id, text="Sir, kripya sirf Excel (.xlsx) ya CSV file bhejein.")
+                return
+
+            tg_file = await bot.get_file(doc["file_id"])
+            local_path = f"/tmp/up_{msg_id}_{file_name}"
+            await tg_file.download_to_drive(local_path)
+
+            if file_name.endswith('.csv'):
+                uploaded_sheets = {"Sheet1": pd.read_csv(local_path)}
+            else:
+                uploaded_sheets = pd.read_excel(local_path, sheet_name=None)
+
+            sheet_summary = analyze_basuli_sheet()
+            ai_reply = ask_groq(f"Sheet Data:\n{sheet_summary}", "User ne nayi Excel file bheji hai. Strict Senior Manager ki tarah 3 line mein total pending amount aur top parties batayein.")
+            audio_file, clean_reply = await generate_voice(ai_reply, f"/tmp/doc_{msg_id}.mp3")
+            with open(audio_file, "rb") as audio:
+                await bot.send_voice(chat_id=chat_id, voice=audio, caption=f"✅ Excel File Load Ho Gayi!\n\n{clean_reply}")
+            return
+
+        # Case B: Voice Message or Text Message
+        user_text = ""
+        if "voice" in message:
+            tg_file = await bot.get_file(message["voice"]["file_id"])
+            ogg_path = f"/tmp/voice_{msg_id}.ogg"
+            await tg_file.download_to_drive(ogg_path)
+
+            with open(ogg_path, "rb") as f:
+                transcription = groq_client.audio.transcriptions.create(
+                    file=(ogg_path, f.read()),
+                    model="whisper-large-v3-turbo",
+                    language="hi",
+                    prompt="Tarun aur Ajay ki total udhaari kitni hai. Sitaram Rathi ke sare bill batao. Gurukrapa Traders, Ravindra Kumar, Brajmohan Kirana, Namo Kirana, Gadarwara."
+                )
+            user_text = transcription.text
+        elif "text" in message:
+            user_text = message["text"]
+            if user_text.startswith("/start"):
+                await bot.send_message(chat_id=chat_id, text="Sir, Senior Vasuli Manager Agent active hai. Voice note ya text bhej kar hisab poochein.")
+                return
         else:
-            uploaded_sheets = pd.read_excel(local_path, sheet_name=None)
+            return
 
-        sheet_summary = analyze_basuli_sheet()
-        prompt = "User ne abhi Excel file bheji hai. Ekdum aam bolchal ki desi Hindi mein 3 line mein batao ki file lag gayi hai aur kul kitna paisa baki hai."
-        ai_reply = ask_groq(f"Sheet Data:\n{sheet_summary}", prompt)
+        print(f"User Query: {user_text}")
+        sheet_analysis = analyze_basuli_sheet()
 
-        voice_note, clean_reply = await text_to_voice(ai_reply, "sheet_loaded.mp3")
-        with open(voice_note, "rb") as audio:
-            await update.message.reply_voice(voice=audio, caption=f"✅ File Load Ho Gayi!\n\n{clean_reply}")
+        if sheet_analysis == "NO_SHEET_LOADED":
+            msg = "Sir, Google Sheet load nahi ho payi hai. Link check kar lein ya seedha Excel file bhej dein."
+            audio_file, clean_reply = await generate_voice(msg, f"/tmp/err_{msg_id}.mp3")
+            with open(audio_file, "rb") as audio:
+                await bot.send_voice(chat_id=chat_id, voice=audio, caption=clean_reply)
+            return
+
+        system_prompt = f"""
+        Tum ek strict, to-the-point aur Professional Senior Vasuli Manager ho.
+        Salesmen ke naam: Tarun (Local market) aur Ajay (Upcountry market).
+
+        NICHE GOOGLE SHEET KA LIVE DATA HAI:
+        {sheet_analysis}
+
+        SAKHT NIYAM:
+        1. 'Bhai', 'Yaar', ya 'Bade bhai' jaise shabd Kisi bhi haal mein mat bolna. Boss ko 'Sir' bolna, aur Salesman (Tarun/Ajay) ko seedha unke naam se address karna.
+        2. Tone ekdum professional, vyaparik aur crisp rakhna (Jaise: 'Sir, Sitaram Rathi ke 8 bills mein kul 1 lakh 401 rupaye baki hain').
+        3. Party ka naam bolte waqt aage laga 'PARLE' ya 'ZB' hata kar seedha dukan ka naam bolna.
+        4. Agar bill-wise detail mangi jaye, toh bina ek bhi bill chhode saare bills ki tarikh, bill number aur rupaye fatafat point-to-point ginwana.
+        5. Agar Boss bolein ki Tarun ya Ajay ke liye voice note do, toh ekdum kadak Manager ki tarah seedha aadesh dena (Jaise: 'Tarun, aaj Gadarwara market mein in 5 partiyon ka payment har haal mein clear karwana hai, dhyan rahe').
+        6. Koi star (**) ya markdown mat lagana.
+        """
+
+        ai_reply = ask_groq(system_prompt, user_text)
+        print(f"AI Reply: {ai_reply}")
+
+        audio_file, clean_reply = await generate_voice(ai_reply, f"/tmp/rep_{msg_id}.mp3")
+        with open(audio_file, "rb") as audio:
+            await bot.send_voice(chat_id=chat_id, voice=audio, caption=f"📋 Manager Report:\n{clean_reply}")
+
     except Exception as e:
-        await update.message.reply_text(f"File padhne mein dikkat aayi: {e}")
+        print(f"Processing error: {e}")
+        try:
+            await bot.send_message(chat_id=chat_id, text=f"Sir, technical dikkat aayi: {str(e)[:150]}")
+        except Exception:
+            pass
 
-# --- 7. VOICE & TEXT MESSAGE HANDLER ---
-async def process_query(update: Update, user_text: str):
-    print(f"Aapne Kaha: {user_text}")
-    sheet_analysis = analyze_basuli_sheet(user_text)
+def run_in_background(data):
+    asyncio.run(process_telegram_update(data))
 
-    if sheet_analysis == "NO_SHEET_LOADED":
-        msg = "Sir, Google Sheet load nahi ho payi hai. Ek baar link check kar lein ya Excel file bhej dein."
-        voice_note, clean_reply = await text_to_voice(msg, "err.mp3")
-        with open(voice_note, "rb") as audio:
-            await update.message.reply_voice(voice=audio, caption=clean_reply)
-        return
+# --- 7. FLASK ROUTES (Instant Wake-Up & Zero Timeout) ---
+@app.route("/", methods=["GET", "HEAD"])
+def health_check():
+    return "Vasuli Manager Bot is Alive and Active!", 200
 
-    system_prompt = f"""
-    Tum ek strict, to-the-point aur Professional Senior Vasuli Manager ho.
-    Salesmen ke naam: Tarun (Local market) aur Ajay (Upcountry market).
+@app.route("/telegram", methods=["POST"])
+def telegram_webhook():
+    data = request.get_json(silent=True)
+    if data:
+        update_id = data.get("update_id")
+        if update_id and update_id not in processed_updates:
+            processed_updates.add(update_id)
+            if len(processed_updates) > 200:
+                processed_updates.clear()
+            threading.Thread(target=run_in_background, args=(data,), daemon=True).start()
+    return "OK", 200
 
-    NICHE GOOGLE SHEET KA LIVE DATA HAI:
-    {sheet_analysis}
-
-    SAKHT NIYAM:
-    1. 'Bhai', 'Yaar', ya 'Bade bhai' jaise shabd Kisi bhi haal mein mat bolna. Boss se baat karte waqt 'Sir' bolna, aur Salesman (Tarun/Ajay) ko seedha unke naam se address karna.
-    2. Tone ekdum professional, vyaparik aur crisp rakhna (Jaise: 'Sir, Sitaram Rathi ke 8 bills mein kul 1 lakh 401 rupaye baki hain').
-    3. Party ka naam bolte waqt aage laga 'PARLE' ya 'ZB' hata kar seedha dukan ka naam bolna.
-    4. Agar bill-wise detail mangi jaye, toh bina ek bhi bill chhode saare bills ki tarikh, bill number aur rupaye fatafat point-to-point ginwana.
-    5. Agar Boss bolein ki Tarun ya Ajay ke liye voice note do, toh ekdum kadak Manager ki tarah seedha aadesh dena (Jaise: 'Tarun, aaj Gadarwara market mein in 5 partiyon ka payment har haal mein clear karwana hai, dhyan rahe').
-    6. Koi star (**) ya markdown mat lagana.
-    """
-
-    ai_reply = ask_groq(system_prompt, user_text)
-    print(f"AI Jawab: {ai_reply}")
-
-    voice_note, clean_reply = await text_to_voice(ai_reply, "vasuli_reply.mp3")
-    with open(voice_note, "rb") as audio:
-        await update.message.reply_voice(voice=audio, caption=f"📋 Manager Report:\n{clean_reply}")
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    voice_file = await update.message.voice.get_file()
-    audio_path = "user_voice.ogg"
-    await voice_file.download_to_drive(audio_path)
-
-    with open(audio_path, "rb") as file:
-        transcription = groq_client.audio.transcriptions.create(
-            file=(audio_path, file.read()),
-            model="whisper-large-v3-turbo",
-            language="hi",
-            prompt="Tarun aur Ajay ki total udhaari kitni hai. Sitaram Rathi ke sare bill batao. Gurukrapa Traders, Ravindra Kumar, Brajmohan Kirana, Namo Kirana, Gadarwara."
+# --- 8. AUTO-REGISTER WEBHOOK ON STARTUP ---
+def setup_webhook():
+    try:
+        webhook_target = f"{RENDER_URL}/telegram"
+        res = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
+            params={"url": webhook_target, "drop_pending_updates": True},
+            timeout=10
         )
-    await process_query(update, transcription.text)
+        print(f"Webhook Setup Status: {res.json()}")
+    except Exception as e:
+        print(f"Webhook setup error: {e}")
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.text:
-        await process_query(update, update.message.text)
-
-# --- 8. WEBHOOK SERVER (Message bhejte hi Render ko jagane ke liye) ---
-def main():
-    port = int(os.environ.get("PORT", 10000))
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # Agar Render par chal raha hai toh Webhook chalu karega (Jo sleep se khud jaga dega)
-    if os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"):
-        clean_url = RENDER_URL.rstrip("/")
-        print(f"Starting Webhook on {clean_url} (Port {port})...")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path="telegram",
-            webhook_url=f"{clean_url}/telegram",
-            drop_pending_updates=True
-        )
-    else:
-        print("Local PC Mode Chalu Hai!")
-        app.run_polling(drop_pending_updates=True)
+setup_webhook()
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
